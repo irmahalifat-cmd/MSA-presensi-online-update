@@ -97,6 +97,9 @@ body{
 .server-status.off{color:var(--rust); border-color:rgba(192,96,75,0.3); background:rgba(192,96,75,0.06);}
 .server-status.off .dot{background:var(--rust);}
 .server-status.checking .dot{background:var(--text-faint); animation:pulse 1s infinite;}
+.server-status{cursor:pointer;}
+.server-status.retry{color:#9A6B12; border-color:rgba(217,164,65,0.4); background:rgba(217,164,65,0.10);}
+.server-status.retry .dot{background:#D9A441; animation:pulse 1s infinite;}
 .clock{font-family:'JetBrains Mono',monospace; font-size:13.75px; color:var(--text-dim); text-align:right; line-height:1.2;}
 .clock b{color:var(--text); display:block; font-size:15px;}
 .btn-ghost{
@@ -603,17 +606,27 @@ const ICON = {
 // password (API_PASSWORD) yang sama dengan yang ditulis di Code.gs.
 // Selama dua nilai ini kosong, verifikasi PIN akan menampilkan pesan
 // "server belum terhubung" alih-alih diam-diam menerima PIN apa pun.
-const API_URL = 'https://script.google.com/macros/s/AKfycbxHH-3cDaUeEb6cb7vy7qQopJsYPpq6WeL_mJh447DXSgSBdKt17vxF_B8kYUWW8HSN2g/exec'
+const API_URL = 'https://script.google.com/macros/s/AKfycbxHH-3cDaUeEb6cb7vy7qQopJsYPpq6WeL_mJh447DXSgSBdKt17vxF_B8kYUWW8HSN2g/exec';
 const API_KEY = 'SMA04T'; // samakan dengan API_PASSWORD di Code.gs
 
 async function callApi(payload){
   if(!API_URL){ throw new Error('SERVER_BELUM_DIKONFIGURASI'); }
-  const res = await fetch(API_URL, {
-    method:'POST',
-    headers:{ 'Content-Type':'text/plain;charset=utf-8' }, // hindari CORS preflight Apps Script
-    body: JSON.stringify({ ...payload, key: API_KEY })
-  });
-  const json = await res.json();
+  let json;
+  try{
+    const res = await fetch(API_URL, {
+      method:'POST',
+      headers:{ 'Content-Type':'text/plain;charset=utf-8' }, // hindari CORS preflight Apps Script
+      credentials:'omit',
+      body: JSON.stringify({ ...payload, key: API_KEY })
+    });
+    json = await res.json();
+  }catch(netErr){
+    // Gagal jaringan/timeout: minta pemeriksaan ulang lampu indikator sebentar lagi.
+    scheduleServerCheck(1500);
+    throw netErr;
+  }
+  // Server membalas JSON valid = server terjangkau (kecuali kunci API salah).
+  if(json && !(json.ok === false && /api key/i.test(String(json.error||'')))){ markServerConnected(); }
   if(!json.ok){
     const err = new Error(json.error || 'Permintaan ditolak server.');
     // Tandai error ini sebagai penolakan DUPLIKAT (bukan sekadar gagal jaringan)
@@ -627,15 +640,38 @@ async function callApi(payload){
 }
 
 /* ================= STATUS KONEKSI SERVER (lampu indikator) ================= */
+// [PERKUATAN KONEKSI] Lampu indikator kini:
+//  - memakai BATAS WAKTU (timeout) + PERCOBAAN ULANG otomatis (cold start Apps Script
+//    sering butuh beberapa detik; satu kali gagal TIDAK lagi langsung "Terputus"),
+//  - tidak berkedip abu-abu saat pemeriksaan latar belakang (tetap hijau selama masih sehat),
+//  - langsung HIJAU begitu permintaan apa pun ke server berhasil (data awal, simpan
+//    presensi, dll.) — tanpa menunggu ping terpisah,
+//  - memeriksa lebih sering (15 dtk) saat putus & lebih jarang (60 dtk) saat sehat,
+//  - memeriksa ulang otomatis saat internet kembali / tab dibuka lagi / lampu diketuk,
+//  - membedakan penyebab: tidak ada internet, akses server ditolak, atau kunci API salah.
+const PING_TIMEOUT_MS = 20000;
+const PING_RETRY_DELAYS_MS = [1500, 4000, 8000]; // total 4 percobaan
+const HEALTH_INTERVAL_OK_MS = 60000;
+const HEALTH_INTERVAL_DOWN_MS = 15000;
+let serverCheckPromise = null;
+let serverCheckTimer = null;
+let lastServerOkAt = 0;
+
 function serverStatusBadgeHtml(){
   const cfgMap = {
     checking:    { cls:'checking', label:'Memeriksa Server...' },
+    retrying:    { cls:'retry',    label:'Menyambungkan Ulang...' },
     connected:   { cls:'on',       label:'Server Tersambung' },
-    disconnected:{ cls:'off',      label:'Server Terputus' },
+    disconnected:{ cls:'off',      label:'Server Terputus', hint:'Pastikan Web App di-deploy dengan akses "Anyone" dan URL berakhiran /exec benar. Ketuk untuk cek ulang.' },
+    denied:      { cls:'off',      label:'Akses Server Ditolak', hint:'Deploy Web App: Execute as "Me", Who has access "Anyone", lalu buat versi baru. Ketuk untuk cek ulang.' },
+    badkey:      { cls:'off',      label:'Kunci API Salah', hint:'API_KEY di aplikasi harus sama dengan API_PASSWORD di sheet Config.' },
+    offline:     { cls:'off',      label:'Tidak Ada Internet', hint:'Perangkat sedang offline. Akan tersambung otomatis saat internet kembali.' },
     unconfigured:{ cls:'off',      label:'Server Belum Diatur' },
   };
   const cfg = cfgMap[state.serverStatus] || cfgMap.disconnected;
-  return `<div class="server-status ${cfg.cls}" id="serverStatusBadge" title="${cfg.label}"><span class="dot"></span><span class="label">${cfg.label}</span></div>`;
+  const detail = state.serverStatusDetail || cfg.hint || '';
+  const title = (cfg.label + (detail ? ' — ' + detail : '')).replace(/"/g, '&quot;');
+  return `<div class="server-status ${cfg.cls}" id="serverStatusBadge" title="${title}"><span class="dot"></span><span class="label">${cfg.label}</span></div>`;
 }
 
 function updateServerStatusBadge(){
@@ -643,22 +679,97 @@ function updateServerStatusBadge(){
   if(el) el.outerHTML = serverStatusBadgeHtml();
 }
 
-async function checkServerStatus(){
-  if(!API_URL){
-    state.serverStatus = 'unconfigured';
-    updateServerStatusBadge();
-    return;
-  }
-  state.serverStatus = 'checking';
+function setServerStatus(status, detail){
+  state.serverStatus = status;
+  state.serverStatusDetail = detail || '';
   updateServerStatusBadge();
+}
+
+function sleepMs(ms){ return new Promise(r => setTimeout(r, ms)); }
+
+async function fetchWithTimeout(url, opts, ms){
+  const ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+  const timer = ctrl ? setTimeout(() => ctrl.abort(), ms) : null;
   try{
-    const res = await fetch(`${API_URL}?action=ping&key=${encodeURIComponent(API_KEY)}`);
-    const json = await res.json();
-    state.serverStatus = (json && json.ok) ? 'connected' : 'disconnected';
-  }catch(e){
-    state.serverStatus = 'disconnected';
+    return await fetch(url, ctrl ? { ...opts, signal: ctrl.signal } : opts);
+  }finally{
+    if(timer) clearTimeout(timer);
   }
-  updateServerStatusBadge();
+}
+
+// Satu kali ping. Mengembalikan { status, final? }.
+async function pingServerOnce(){
+  const url = `${API_URL}?action=ping&key=${encodeURIComponent(API_KEY)}&_=${Date.now()}`;
+  const res = await fetchWithTimeout(url, { method:'GET', cache:'no-store', credentials:'omit', redirect:'follow' }, PING_TIMEOUT_MS);
+  const text = await res.text();
+  let json = null;
+  try{ json = JSON.parse(text); }catch(e){ /* bukan JSON */ }
+  if(json && json.ok) return { status:'connected' };
+  if(json && /api key/i.test(String(json.error || ''))) return { status:'badkey', final:true };
+  if(!json) return { status:'denied' }; // biasanya halaman HTML login/izin Google
+  return { status:'disconnected' };
+}
+
+async function runServerCheck(){
+  const startedAt = Date.now();
+  const wasConnected = state.serverStatus === 'connected';
+  if(!wasConnected) setServerStatus('checking');
+
+  let last = { status:'disconnected' };
+  for(let attempt = 0; attempt <= PING_RETRY_DELAYS_MS.length; attempt++){
+    try{
+      last = await pingServerOnce();
+    }catch(e){
+      last = {
+        status: (typeof navigator !== 'undefined' && navigator.onLine === false) ? 'offline' : 'disconnected',
+        detail: (e && e.name === 'AbortError') ? 'Server lambat merespons (timeout). Ketuk untuk cek ulang.' : ''
+      };
+    }
+    if(last.status === 'connected' || last.final || last.status === 'offline') break;
+    if(attempt < PING_RETRY_DELAYS_MS.length){
+      if(!wasConnected || attempt >= 1) setServerStatus('retrying');
+      await sleepMs(PING_RETRY_DELAYS_MS[attempt]);
+    }
+  }
+  // Kalau selama pemeriksaan ini ada permintaan lain yang BERHASIL, server jelas sehat.
+  if(last.status !== 'connected' && lastServerOkAt >= startedAt) last = { status:'connected' };
+  setServerStatus(last.status, last.detail);
+}
+
+function checkServerStatus(){
+  if(!API_URL){ setServerStatus('unconfigured'); return Promise.resolve(); }
+  if(serverCheckPromise) return serverCheckPromise;
+  serverCheckPromise = runServerCheck()
+    .catch(() => setServerStatus('disconnected'))
+    .finally(() => { serverCheckPromise = null; scheduleServerCheck(); });
+  return serverCheckPromise;
+}
+
+function scheduleServerCheck(delayMs){
+  clearTimeout(serverCheckTimer);
+  const d = (delayMs != null) ? delayMs : (state.serverStatus === 'connected' ? HEALTH_INTERVAL_OK_MS : HEALTH_INTERVAL_DOWN_MS);
+  serverCheckTimer = setTimeout(checkServerStatus, d);
+}
+
+// Dipanggil setiap kali SEBUAH permintaan ke server berhasil dijawab.
+function markServerConnected(){
+  lastServerOkAt = Date.now();
+  if(state.serverStatus !== 'connected') setServerStatus('connected');
+  if(!serverCheckPromise) scheduleServerCheck();
+}
+
+function startServerHealthMonitor(){
+  checkServerStatus();
+  window.addEventListener('online', () => { checkServerStatus(); });
+  window.addEventListener('offline', () => { setServerStatus('offline'); });
+  document.addEventListener('visibilitychange', () => {
+    if(document.visibilityState === 'visible') checkServerStatus();
+  });
+  // Ketuk lampu indikator = paksa cek ulang sekarang.
+  document.addEventListener('click', (e) => {
+    const b = e.target && e.target.closest ? e.target.closest('#serverStatusBadge') : null;
+    if(b && state.serverStatus !== 'checking' && state.serverStatus !== 'retrying') checkServerStatus();
+  });
 }
 
 /* ================= STATE ================= */
@@ -692,7 +803,8 @@ let state = {
   adminUnlocked:false,
   petugasUnlocked:false,
   pinLoading:false,
-  serverStatus:'checking', // 'checking' | 'connected' | 'disconnected' | 'unconfigured'
+  serverStatus:'checking', // 'checking' | 'retrying' | 'connected' | 'disconnected' | 'denied' | 'badkey' | 'offline' | 'unconfigured'
+  serverStatusDetail:'',
   adminTab:'siswa',
   petugasMode:null, // 'masuk' | 'pulang' | 'manual' | 'manualMasuk' | 'manualPulang' | 'tidakHadir'
   selectedStudent:null,
@@ -849,6 +961,7 @@ async function fetchStudentsFromServer(){
   const res = await fetch(`${API_URL}?action=getStudents&key=${encodeURIComponent(API_KEY)}`);
   const json = await res.json();
   if(!json.ok) throw new Error(json.error || 'Gagal memuat data siswa dari server.');
+  markServerConnected();
   return json.data || [];
 }
 
@@ -856,6 +969,7 @@ async function fetchLogsFromServer(){
   const res = await fetch(`${API_URL}?action=getRecentLogs&key=${encodeURIComponent(API_KEY)}&months=${LOG_MONTHS_TO_LOAD}`);
   const json = await res.json();
   if(!json.ok) throw new Error(json.error || 'Gagal memuat riwayat dari server.');
+  markServerConnected();
   return json.data || [];
 }
 
@@ -873,6 +987,7 @@ async function fetchBootstrapFromServer(){
   const res = await fetch(`${API_URL}?action=getBootstrap&key=${encodeURIComponent(API_KEY)}&months=${LOG_MONTHS_TO_LOAD}`);
   const json = await res.json();
   if(!json.ok) throw new Error(json.error || 'Gagal memuat data awal dari server.');
+  markServerConnected();
   return json.data || {};
 }
 
@@ -3459,8 +3574,7 @@ async function tickScan(video){
 
 /* ================= INIT ================= */
 loadData();
-checkServerStatus();
-setInterval(checkServerStatus, 120000); // periksa ulang setiap 2 menit
+startServerHealthMonitor(); // ping + percobaan ulang + pemantauan berkala (lihat blok STATUS KONEKSI SERVER)
 </script>
 </body>
 </html>
