@@ -418,7 +418,7 @@ main{flex:1; display:flex; flex-direction:column; min-height:0; overflow:hidden;
 /* Notifikasi tulisan (toast) untuk pemindaian gagal/ditolak — tampil melayang di
    atas layar, terlihat jelas baik saat memindai lewat kamera maupun input manual. */
 .global-toast{
-  position:fixed; left:50%; top:14px; z-index:9999; max-width:92vw;
+  position:fixed; left:50%; top:calc(env(safe-area-inset-top, 0px) + 14px); z-index:99999; max-width:92vw;
   padding:11px 18px; border-radius:11px; font-size:14.38px; font-weight:600; line-height:1.35;
   text-align:center; color:#fff; box-shadow:0 8px 22px rgba(0,0,0,0.28);
   opacity:0; pointer-events:none; transform:translate(-50%,-16px);
@@ -427,7 +427,7 @@ main{flex:1; display:flex; flex-direction:column; min-height:0; overflow:hidden;
 .global-toast.show{opacity:1; transform:translate(-50%,0);}
 .global-toast.err{background:#B3261E;}
 .global-toast.warn{background:#9A6B08;}
-.global-toast.ok{background:#1E8E5A;}
+.global-toast.ok{background:#1E8E5A; font-size:16.5px; font-weight:700; padding:14px 22px; border:2px solid rgba(255,255,255,0.55); box-shadow:0 10px 28px rgba(30,142,90,0.45);}
 
 .search-box{position:relative; margin-bottom:8px;}
 .search-results{max-height:130px; overflow-y:auto; -webkit-overflow-scrolling:touch; display:flex; flex-direction:column; gap:6px;}
@@ -2904,6 +2904,7 @@ async function confirmManualAttendance(type){
   playScanBeep();
   state.logs.push(log);
   state.lastResult = { student:s, ket:'', sendWa, type };
+  showToast(`✓ BERHASIL — ${s.name}${s.kelas ? ' (' + s.kelas + ')' : ''} tercatat ${type==='masuk' ? 'MASUK' : (type==='pulang' ? 'PULANG' : String(type).toUpperCase())} pukul ${timeOnly(log.timestamp)}`, 'ok');
   const sp = document.getElementById('sidePanel'); if(sp) sp.innerHTML = sidePanelContent();
 }
 
@@ -3040,22 +3041,101 @@ function ensureToastEl(){
   }
   return el;
 }
-function showToast(message, kind){
+function showToast(message, kind, durationMs){
   const el = ensureToastEl();
+  el.setAttribute('role', 'status');
+  el.setAttribute('aria-live', 'assertive');
   el.textContent = message;
   el.className = `global-toast show ${kind||'err'}`;
   if(toastTimer) clearTimeout(toastTimer);
-  toastTimer = setTimeout(()=>{ el.classList.remove('show'); }, 3400);
+  // Notifikasi BERHASIL tampil lebih lama (4,5 dtk) supaya petugas sempat membaca
+  // nama siswa; notifikasi lain tetap 3,4 dtk.
+  const ms = durationMs || ((kind === 'ok') ? 4500 : 3400);
+  toastTimer = setTimeout(()=>{ el.classList.remove('show'); }, ms);
 }
 
 /* ================= AUDIO: efek bunyi pemindaian ================= */
 let audioCtx = null;
 function ensureAudio(){
   if(!audioCtx){
-    try{ audioCtx = new (window.AudioContext || window.webkitAudioContext)(); }catch(e){ /* audio tidak didukung */ }
+    try{
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      // Mode PWA (layar utama) & Safari iOS sering menghentikan AudioContext ('suspended'/
+      // 'interrupted') — lanjutkan otomatis setiap kali statusnya berubah.
+      audioCtx.onstatechange = () => {
+        if(audioCtx && audioCtx.state !== 'running' && audioCtx.state !== 'closed'){ try{ audioCtx.resume(); }catch(e){} }
+      };
+    }catch(e){ /* audio tidak didukung */ }
   }
-  if(audioCtx && audioCtx.state === 'suspended'){ audioCtx.resume(); }
+  if(audioCtx && audioCtx.state !== 'running' && audioCtx.state !== 'closed'){
+    try{ const pr = audioCtx.resume(); if(pr && pr.catch) pr.catch(()=>{}); }catch(e){}
+  }
 }
+
+// [BIP PANJANG — PWA & BUKAN PWA] Bip sukses dimainkan lewat elemen <audio> (WAV yang
+// dibuat sendiri di sini, tanpa file eksternal) SEBAGAI JALUR UTAMA, karena:
+//  - di iPhone/iPad (terutama saat dipasang sebagai PWA), Web Audio DIBISUKAN oleh
+//    tombol senyap & mudah 'suspended', sedangkan elemen <audio> tetap berbunyi;
+//  - di Android/desktop keduanya bekerja, jadi perilakunya seragam.
+// Kalau <audio> ditolak browser, otomatis jatuh ke Web Audio (nada panjang yang sama).
+const SCAN_BEEP_SECONDS = 1.3;
+let scanBeepAudio = null;
+let scanBeepUrl = null;
+function buildScanBeepWavUrl(){
+  const rate = 22050, n = Math.floor(rate * SCAN_BEEP_SECONDS);
+  const buf = new ArrayBuffer(44 + n * 2), dv = new DataView(buf);
+  const wr = (o, s) => { for(let i=0;i<s.length;i++) dv.setUint8(o+i, s.charCodeAt(i)); };
+  wr(0,'RIFF'); dv.setUint32(4, 36 + n*2, true); wr(8,'WAVE'); wr(12,'fmt ');
+  dv.setUint32(16,16,true); dv.setUint16(20,1,true); dv.setUint16(22,1,true);
+  dv.setUint32(24,rate,true); dv.setUint32(28,rate*2,true); dv.setUint16(32,2,true); dv.setUint16(34,16,true);
+  wr(36,'data'); dv.setUint32(40, n*2, true);
+  for(let i=0;i<n;i++){
+    const t = i / rate;
+    const f = t < 0.14 ? 988 : 1319;                       // "ding" pendek lalu nada tinggi panjang
+    const attack = Math.min(1, t / 0.008);
+    const release = Math.min(1, (SCAN_BEEP_SECONDS - t) / 0.30);
+    const env = attack * release;
+    const s = 0.62*Math.sin(2*Math.PI*f*t) + 0.28*Math.sin(2*Math.PI*f*2*t) + 0.10*Math.sin(2*Math.PI*f*3*t);
+    dv.setInt16(44 + i*2, Math.max(-1, Math.min(1, s * env * 0.95)) * 32767, true);
+  }
+  return URL.createObjectURL(new Blob([buf], { type:'audio/wav' }));
+}
+function ensureScanBeepAudio(){
+  if(scanBeepAudio) return scanBeepAudio;
+  try{
+    scanBeepUrl = buildScanBeepWavUrl();
+    scanBeepAudio = new Audio(scanBeepUrl);
+    scanBeepAudio.preload = 'auto';
+    scanBeepAudio.setAttribute('playsinline', '');
+  }catch(e){ scanBeepAudio = null; }
+  return scanBeepAudio;
+}
+// "Membuka kunci" audio pada gestur pertama pengguna (ketuk/klik/tombol) — WAJIB agar
+// bip boleh berbunyi belakangan dari loop kamera (yang bukan gestur pengguna), baik di
+// browser biasa maupun PWA.
+function unlockAudio(){
+  ensureAudio();
+  const a = ensureScanBeepAudio();
+  if(a && !a.__unlocked){
+    try{
+      a.muted = true;
+      const pr = a.play();
+      const done = () => { try{ a.pause(); a.currentTime = 0; }catch(e){} a.muted = false; a.__unlocked = true; };
+      if(pr && pr.then){ pr.then(done).catch(() => { a.muted = false; }); } else { done(); }
+    }catch(e){ a.muted = false; }
+  }
+  if(audioCtx && audioCtx.state === 'running' && !audioCtx.__primed){
+    try{
+      const b = audioCtx.createBuffer(1, 1, 22050), s = audioCtx.createBufferSource();
+      s.buffer = b; s.connect(audioCtx.destination); s.start(0); audioCtx.__primed = true;
+    }catch(e){}
+  }
+}
+['pointerdown','touchstart','touchend','click','keydown'].forEach(ev =>
+  document.addEventListener(ev, unlockAudio, { capture:true, passive:true })
+);
+document.addEventListener('visibilitychange', () => { if(document.visibilityState === 'visible') ensureAudio(); });
+window.addEventListener('pageshow', () => { ensureAudio(); });
 function playBeep(freq, duration, type, volume, delay){
   if(!audioCtx) return;
   try{
@@ -3086,12 +3166,25 @@ function vibrateDevice(pattern){
 // Pemindai Pulang. Dibuat panjang & keras: dua nada NAIK ("ding-DING") berurutan
 // dengan lapisan oktaf di atasnya, supaya terasa besar/penuh dan jelas terdengar
 // meski di lingkungan gerbang yang ramai.
-function playScanBeep(){
-  vibrateDevice(60); // getaran pendek tunggal = sinyal "berhasil" yang singkat & positif
+function playScanBeepWebAudio(){
+  ensureAudio();
   if(!audioCtx) return;
-  playBeep(988,  0.16, 'triangle', 0.95, 0);     // nada 1 (pendek)
-  playBeep(1319, 0.36, 'triangle', 0.98, 0.15);  // nada 2 (naik, panjang) — puncak bip
-  playBeep(1976, 0.32, 'sine',     0.55, 0.15);  // lapisan oktaf atas, kesan "besar"/penuh
+  playBeep(988,  0.16, 'triangle', 0.95, 0);      // nada 1 (pendek)
+  playBeep(1319, 1.15, 'triangle', 0.98, 0.14);   // nada 2 (PANJANG ±1,1 dtk)
+  playBeep(2638, 1.00, 'sine',     0.40, 0.14);   // lapisan oktaf atas, kesan penuh
+}
+function playScanBeep(){
+  vibrateDevice(120); // getaran sukses (Android)
+  const a = ensureScanBeepAudio();
+  if(a){
+    try{
+      a.muted = false; a.volume = 1; a.currentTime = 0;
+      const pr = a.play();
+      if(pr && pr.catch){ pr.catch(() => playScanBeepWebAudio()); }
+      return;
+    }catch(e){ /* jatuh ke Web Audio di bawah */ }
+  }
+  playScanBeepWebAudio();
 }
 // Bip pemindaian GAGAL/DITOLAK (kode tak dikenali ATAU sudah tercatat hari ini) —
 // dipakai SAMA PERSIS untuk Pemindai Masuk maupun Pemindai Pulang. Sengaja dibuat
@@ -3412,7 +3505,7 @@ async function processScanResult(found, scannedCode, now, mode){
         state.logs.push(log);
         state.lastResult = { student:found, ket:'', sendWa:state.sendWaNotif, type:mode };
         const offlineNote = result.offline ? ' (belum tersinkron ke server — periksa koneksi)' : '';
-        showToast(`Tercatat — ${found.name} ${label} pukul ${timeOnly(now)}${offlineNote}`, result.offline ? 'warn' : 'ok');
+        showToast(`✓ PEMINDAIAN BERHASIL — ${found.name}${found.kelas ? ' (' + found.kelas + ')' : ''} tercatat ${label} pukul ${timeOnly(now)}${offlineNote}`, result.offline ? 'warn' : 'ok');
         refreshSidePanel();
   }catch(e){
     // gagal tak terduga — buka kunci supaya kartu bisa dipindai ulang
